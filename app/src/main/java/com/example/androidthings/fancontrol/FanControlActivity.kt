@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 /*
  * Copyright 2018 The Android Open Source Project
  *
@@ -35,22 +34,41 @@ import android.app.Activity
 import android.content.Context
 import android.graphics.Color
 
+import android.util.Log
+import com.google.android.things.contrib.driver.apa102.Apa102
+import com.google.android.things.contrib.driver.ht16k33.AlphanumericDisplay
+import com.google.android.things.pio.Gpio
+import com.google.android.things.pio.PeripheralManager
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
+
+
 import android.net.ConnectivityManager
 import android.net.NetworkInfo
 import android.os.Bundle
 import android.os.Handler
 import android.os.Message
-import android.util.Log
 import android.view.KeyEvent
 
-import com.google.android.things.contrib.driver.apa102.Apa102
 import com.google.android.things.contrib.driver.button.Button
 import com.google.android.things.contrib.driver.button.ButtonInputDriver
-import com.google.android.things.contrib.driver.ht16k33.AlphanumericDisplay
-import com.google.android.things.pio.Gpio
-import com.google.android.things.pio.PeripheralManager
 
-import java.io.IOException
+import com.google.android.things.iotcore.ConnectionParams
+import com.google.android.things.iotcore.IotCoreClient
+import com.google.android.things.iotcore.OnConfigurationListener
+import com.google.android.things.iotcore.TelemetryEvent
+
+import org.json.JSONException
+import org.json.JSONObject
+
+import java.io.UnsupportedEncodingException
+import java.security.KeyFactory
+import java.security.KeyPair
+import java.security.NoSuchAlgorithmException
+import java.security.spec.InvalidKeySpecException
+import java.security.spec.PKCS8EncodedKeySpec
+import kotlin.text.Charsets.UTF_8
 
 class FanControlActivity : Activity() {
 
@@ -68,7 +86,9 @@ class FanControlActivity : Activity() {
     private var alphaTweak = 0
     private var animCounter = 0
     private var mIsConnected: Boolean = false
-    private val mIsSimulated = true
+    private val mIsSimulated = false
+
+    private var client: IotCoreClient? = null
 
     private val mHandler = object : Handler() {
         override fun handleMessage(msg: Message) {
@@ -79,6 +99,17 @@ class FanControlActivity : Activity() {
         }
     }
 
+    private val mTempReportRunnable = object : Runnable {
+        override fun run() {
+            Log.d(TAG, "Publishing telemetry event")
+
+            val payload = String.format("{\"temperature\": %d}", m_currTemp.toInt())
+            val event = TelemetryEvent(payload.toByteArray(), null, TelemetryEvent.QOS_AT_LEAST_ONCE)
+            client!!.publishTelemetry(event)
+
+            mHandler.postDelayed(this, 2000) // Delay 2 secs, repost temp
+        }
+    }
     private val mAnimateRunnable = object : Runnable {
         override fun run() {
             val colors = IntArray(mRainbow.size)
@@ -155,6 +186,25 @@ class FanControlActivity : Activity() {
         }
     }
 
+    private fun onConfigurationReceived(bytes: ByteArray) {
+        if (bytes.size == 0) {
+            Log.d(TAG, "Ignoring empty device config event")
+            return
+        }
+
+        try {
+            val message = JSONObject(String(bytes, UTF_8))
+            m_fanOn = message.getBoolean("fan_on")
+            Log.d(TAG, String.format("Config: %s", String(bytes, UTF_8
+                    )))
+        } catch (je: JSONException) {
+            Log.d(TAG, "Could not decode JSON body for config", je)
+        } catch (iee: UnsupportedEncodingException) {
+            Log.e(TAG, "Could not decode configuration message", iee)
+        }
+
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.d(TAG, "Started Fan Control Station")
@@ -215,6 +265,43 @@ class FanControlActivity : Activity() {
         }
 
         // Configure the Cloud IoT Connector --
+        val pkId = resources.getIdentifier("privatekey", "raw", packageName)
+        try {
+            if (pkId != 0) {
+                val privateKey = applicationContext
+                        .resources.openRawResource(pkId)
+                val keyBytes = inputStreamToBytes(privateKey)
+
+                val spec = PKCS8EncodedKeySpec(keyBytes)
+                val kf = KeyFactory.getInstance("RSA")
+                val keys = KeyPair(null, kf.generatePrivate(spec))
+
+                // Configure Cloud IoT Core project information
+                val connectionParams = ConnectionParams.Builder()
+                        .setProjectId("intense-wavelet-343")
+                        .setRegistry("tour-sub-sub", "us-central1")
+                        .setDeviceId("test-dev")
+                        .build()
+
+                // Initialize the IoT Core client
+                client = IotCoreClient.Builder()
+                        .setConnectionParams(connectionParams)
+                        .setKeyPair(keys)
+                        .setOnConfigurationListener(OnConfigurationListener { this.onConfigurationReceived(it) })
+                        .build()
+
+                // Connect to Cloud IoT Core
+                client!!.connect()
+
+                mHandler.post(mTempReportRunnable)
+            }
+        } catch (ikse: InvalidKeySpecException) {
+            Log.e(TAG, "INVALID Key spec", ikse)
+        } catch (nsae: NoSuchAlgorithmException) {
+            Log.e(TAG, "Algorithm not supported", nsae)
+        } catch (ioe: IOException) {
+            Log.e(TAG, "Could not load key from file", ioe)
+        }
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
@@ -268,13 +355,32 @@ class FanControlActivity : Activity() {
         }
 
         // clean up Cloud publisher.
+        if (client != null && client!!.isConnected) {
+            client!!.disconnect()
+        }
     }
 
     companion object {
 
-        private val TAG = FanControlActivity::class.java!!.getSimpleName()
+        private val TAG = FanControlActivity::class.java.getSimpleName()
         private val LEDSTRIP_BRIGHTNESS = 1
 
         private val MSG_UPDATE_BAROMETER_UI = 1
+
+        @Throws(IOException::class)
+        private fun inputStreamToBytes(inputStream: InputStream): ByteArray {
+            val buffer = ByteArrayOutputStream()
+            var nRead: Int
+            val data = ByteArray(16384)
+
+            do {
+                nRead = inputStream.read(data, 0, data.size)
+                if (nRead > 0)
+                    buffer.write(data, 0, nRead)
+            } while (nRead != -1)
+
+            buffer.flush()
+            return buffer.toByteArray()
+        }
     }
 }
